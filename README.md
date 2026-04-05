@@ -50,10 +50,10 @@ A desktop auto clicker application built with Python, Tkinter, and pynput. Autom
 - **Mouse Control Fails**: Check that pynput is installed correctly and no other applications are interfering with mouse input
 - **Application Crashes**: Check the Activity Log for error messages
 
-## License
-
-MIT License - feel free to use and modify as needed.
-
 ## Coder
 
 JV Oclarit
+
+## License
+
+MIT License - feel free to use and modify as needed.
