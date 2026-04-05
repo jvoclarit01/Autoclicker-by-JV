@@ -602,6 +602,7 @@ class AutoClickerApp:
             self.log("⚠ Interval too small (min 10ms). Set to 10ms.")
 
         self.is_running = True
+        self._session_start = time.monotonic()
         self._set_status(True)
 
         self.worker = ClickWorker(
@@ -617,10 +618,12 @@ class AutoClickerApp:
     def _stop_clicking(self, reason=""):
         if self.worker and self.worker.is_alive():
             self.worker.stop()
+        elapsed = time.monotonic() - getattr(self, "_session_start", time.monotonic())
+        h, m, s = seconds_to_hms(elapsed)
         self.is_running = False
         self._set_status(False)
         if reason:
-            self.log(f"■ Stopped — {reason}")
+            self.log(f"■ Stopped — {reason} | runtime: {h:02d}:{m:02d}:{s:02d} | clicks: {self.total_clicks:,}")
 
     def _set_status(self, running: bool):
         """Update UI status indicators (must run on main thread)."""
