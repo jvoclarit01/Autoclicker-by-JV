@@ -143,16 +143,26 @@ class ClickWorker(threading.Thread):
                                       cfg.get("dur_m", 0),
                                       cfg.get("dur_s", 0))
         start_time   = time.monotonic()
+        done_reason  = None
+
+        # ── initial delay ─────────────────────
+        # Give the user time to move focus away from the app window
+        # before the first click fires (especially important for
+        # "current cursor" mode where clicking Start would self-click).
+        START_DELAY = max(interval, 0.3)
+        if self._sleep_interruptible(START_DELAY):
+            self.on_done_cb("Stopped")
+            return
 
         while not self.stop_event.is_set():
-            # ── termination checks ────────────
+            # ── termination checks ────────────────
             if repeat_mode == "count" and self._click_count >= target_count:
-                self.on_done_cb("Reached click limit")
+                done_reason = "Reached click limit"
                 break
             if repeat_mode == "duration":
                 elapsed = time.monotonic() - start_time
                 if elapsed >= target_dur:
-                    self.on_done_cb("Duration elapsed")
+                    done_reason = "Duration elapsed"
                     break
 
             # ── click ─────────────────────────
@@ -161,14 +171,12 @@ class ClickWorker(threading.Thread):
             self.on_click_cb(self._click_count)
 
             # ── wait for next click ───────────
-            interrupted = self._sleep_interruptible(interval)
-            if interrupted:
+            if self._sleep_interruptible(interval):
                 break
 
         if not self.stop_event.is_set():
             self.stop_event.set()
-        # Notify done (may already have been called above, idempotent in app)
-        self.on_done_cb("Stopped")
+        self.on_done_cb(done_reason or "Stopped")
 
 
 # ─────────────────────────────────────────────
