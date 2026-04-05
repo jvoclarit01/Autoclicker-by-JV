@@ -30,10 +30,9 @@ A desktop auto clicker application built with Python, Tkinter, and pynput. Autom
 
 For users who prefer not to install Python, a pre-built executable is available for Windows:
 
-1. Go to the [Releases](https://github.com/yourusername/autoclicker/releases) page of this repository
-2. Download the latest `autoclicker.exe` file from the assets section
-3. Run the executable directly (no installation required)
-4. The application will start with the same interface and functionality as the Python version
+1. Download the latest `autoclicker.exe` file from the assets section
+2. Run the executable directly (no installation required)
+3. The application will start with the same interface and functionality as the Python version
 
 **Note**: The executable is built for Windows only. For macOS and Linux, please use the Python version above.
 
