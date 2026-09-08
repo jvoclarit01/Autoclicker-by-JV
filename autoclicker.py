@@ -3,22 +3,21 @@ AutoClicker Pro - A full-featured desktop auto clicker
 Built with Tkinter (UI) + pynput (mouse/keyboard control)
 
 Threading & Stopping Logic:
-- A threading.Event (stop_event) acts as the authoritative stop signal.
-- The click worker thread uses time.sleep() sliced into small chunks so it
-  can react to stop_event quickly without busy-waiting on the event itself.
+- A threading.Event is the authoritative stop signal and provides
+  interruptible waits for both click intervals and held mouse buttons.
+- Each worker has a run ID so callbacks from an older run cannot affect a
+  newer run.
 - The global hotkey listener runs in its own daemon thread (pynput's default).
-- Hotkey debouncing is handled via a timestamp + minimum gap check so holding
-  F6 down only fires once per press cycle.
-- All UI updates from background threads go through Tkinter's thread-safe
-  root.after() / queue mechanism so there are no cross-thread widget writes.
+- All requests from background threads go through a queue; Tkinter widgets
+  are only accessed from the main thread.
 """
 
 import tkinter as tk
-from tkinter import ttk, font as tkfont
+from tkinter import ttk
+from dataclasses import dataclass
 import threading
 import time
 import queue
-from pynput import mouse, keyboard
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Listener as KeyListener
 
@@ -27,9 +26,10 @@ from pynput.keyboard import Key, Listener as KeyListener
 #  Constants
 # ─────────────────────────────────────────────
 APP_TITLE = "AutoClicker Pro"
-VERSION   = "v1.0"
+VERSION   = "v1.1"
 DEFAULT_HOTKEY = Key.f6
 HOTKEY_DEBOUNCE_SEC = 0.3   # ignore repeated key events within this window
+START_DELAY_SEC = 0.3
 
 # Dark-theme palette
 BG_DARK    = "#1a1a2e"
@@ -63,120 +63,214 @@ def seconds_to_hms(total):
     return h, m, s
 
 
+class ConfigError(ValueError):
+    """Raised when a UI value cannot be converted into a safe click config."""
+
+
+def _parse_int(value, label, minimum=None, maximum=None):
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be a whole number.") from exc
+    if minimum is not None and parsed < minimum:
+        raise ConfigError(f"{label} must be at least {minimum}.")
+    if maximum is not None and parsed > maximum:
+        raise ConfigError(f"{label} must be at most {maximum}.")
+    return parsed
+
+
+@dataclass(frozen=True)
+class ClickConfig:
+    """Validated, immutable settings consumed by a ClickWorker."""
+
+    interval_seconds: float
+    button: str
+    click_type: str
+    hold_seconds: float
+    position_mode: str
+    pos_x: int
+    pos_y: int
+    repeat_mode: str
+    repeat_count: int
+    duration_seconds: float
+
+    @classmethod
+    def from_values(cls, values):
+        int_h = _parse_int(values["int_h"], "Interval hours", 0, 23)
+        int_m = _parse_int(values["int_m"], "Interval minutes", 0, 59)
+        int_s = _parse_int(values["int_s"], "Interval seconds", 0, 59)
+        int_ms = _parse_int(values["int_ms"], "Interval milliseconds", 0, 999)
+        interval = hms_to_seconds(int_h, int_m, int_s, int_ms)
+        if interval < 0.01:
+            raise ConfigError("Click interval must be at least 10 milliseconds.")
+
+        button = values["button"]
+        if button not in {"Left", "Right", "Middle"}:
+            raise ConfigError("Choose a valid mouse button.")
+
+        click_type = values["click_type"]
+        if click_type not in {"Single", "Double", "Hold"}:
+            raise ConfigError("Choose a valid click type.")
+        hold_ms = 500
+        if click_type == "Hold":
+            hold_ms = _parse_int(
+                values["hold_ms"], "Hold duration", 1, 10_000)
+
+        position_mode = values["position_mode"]
+        if position_mode not in {"current", "fixed"}:
+            raise ConfigError("Choose a valid click position mode.")
+        pos_x = 0
+        pos_y = 0
+        if position_mode == "fixed":
+            pos_x = _parse_int(values["pos_x"], "X coordinate")
+            pos_y = _parse_int(values["pos_y"], "Y coordinate")
+
+        repeat_mode = values["repeat_mode"]
+        if repeat_mode not in {"infinite", "count", "duration"}:
+            raise ConfigError("Choose a valid repeat mode.")
+
+        repeat_count = 1
+        if repeat_mode == "count":
+            repeat_count = _parse_int(
+                values["repeat_count"], "Repeat count", 1, 9_999_999)
+
+        duration = 0.0
+        if repeat_mode == "duration":
+            dur_h = _parse_int(values["dur_h"], "Duration hours", 0, 23)
+            dur_m = _parse_int(values["dur_m"], "Duration minutes", 0, 59)
+            dur_s = _parse_int(values["dur_s"], "Duration seconds", 0, 59)
+            duration = hms_to_seconds(dur_h, dur_m, dur_s)
+            if duration <= 0:
+                raise ConfigError("Run duration must be greater than zero.")
+
+        return cls(
+            interval_seconds=interval,
+            button=button,
+            click_type=click_type,
+            hold_seconds=hold_ms / 1000.0,
+            position_mode=position_mode,
+            pos_x=pos_x,
+            pos_y=pos_y,
+            repeat_mode=repeat_mode,
+            repeat_count=repeat_count,
+            duration_seconds=duration,
+        )
+
+
 # ─────────────────────────────────────────────
 #  Click Worker
 # ─────────────────────────────────────────────
 class ClickWorker(threading.Thread):
-    """
-    Background thread that performs the actual mouse clicks.
+    """Background thread that performs mouse actions for one run."""
 
-    Timing approach:
-      We do NOT use stop_event.wait(interval) as the primary sleep because
-      that wakes up only when the event fires, making it impossible to keep
-      accurate intervals. Instead we use time.sleep() in small slices (50 ms)
-      and check stop_event between slices so the thread exits promptly.
-    """
-
-    SLEEP_SLICE = 0.05   # seconds between stop-event checks
-
-    def __init__(self, config, on_click_cb, on_done_cb):
+    def __init__(self, config, run_id, on_click_cb, on_done_cb,
+                 controller_factory=MouseController, start_delay=START_DELAY_SEC,
+                 clock=time.monotonic):
         """
-        config  – dict with all click parameters (see AutoClickerApp.build_config)
-        on_click_cb(count) – called (thread-safe) after each click
-        on_done_cb(reason) – called when clicking finishes
+        Callbacks receive this worker's run ID so stale events can be ignored.
+        controller_factory and clock are injectable for deterministic tests.
         """
         super().__init__(daemon=True)
         self.config      = config
+        self.run_id      = run_id
         self.on_click_cb = on_click_cb
         self.on_done_cb  = on_done_cb
+        self.controller_factory = controller_factory
+        self.start_delay = start_delay
+        self.clock = clock
         self.stop_event  = threading.Event()
         self._click_count = 0
+        self._stop_reason = "Stopped"
 
-    def stop(self):
-        """Signal the worker to stop at the next check point."""
+    def stop(self, reason="Stopped"):
+        """Signal the worker to stop and wake any interval or hold wait."""
+        self._stop_reason = reason
         self.stop_event.set()
 
-    # ── internal helpers ──────────────────────
-    def _sleep_interruptible(self, duration):
-        """
-        Sleep for `duration` seconds but wake early if stop_event is set.
-        Returns True if we were interrupted, False if we slept fully.
-        """
-        end = time.monotonic() + duration
-        while True:
-            if self.stop_event.is_set():
-                return True
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(self.SLEEP_SLICE, remaining))
+    def _perform_action(self, controller, button, deadline):
+        """Perform one complete action; return False if a hold was interrupted."""
+        cfg = self.config
+        if cfg.position_mode == "fixed":
+            controller.position = (cfg.pos_x, cfg.pos_y)
 
-    def _do_click(self, mc, button, double):
-        """Perform a single or double click, catching any exceptions."""
+        if cfg.click_type == "Single":
+            controller.click(button, 1)
+            return True
+        if cfg.click_type == "Double":
+            controller.click(button, 2)
+            return True
+
+        hold_time = cfg.hold_seconds
+        if deadline is not None:
+            hold_time = min(hold_time, max(0.0, deadline - self.clock()))
+
+        pressed = False
         try:
-            if self.config["position_mode"] == "fixed":
-                mc.position = (self.config["pos_x"], self.config["pos_y"])
-            if double:
-                mc.click(button, 2)
-            else:
-                mc.click(button, 1)
-        except Exception as exc:
-            # Log but don't crash the thread
-            self.on_done_cb(f"Error: {exc}")
-            self.stop_event.set()
+            controller.press(button)
+            pressed = True
+            interrupted = self.stop_event.wait(hold_time)
+            if interrupted:
+                return False
+            return hold_time >= cfg.hold_seconds
+        finally:
+            if pressed:
+                controller.release(button)
 
     # ── main loop ────────────────────────────
     def run(self):
-        cfg     = self.config
-        mc      = MouseController()
-        button  = {"Left": Button.left,
-                   "Right": Button.right,
-                   "Middle": Button.middle}.get(cfg["button"], Button.left)
-        double  = (cfg["click_type"] == "Double")
-        interval = hms_to_seconds(cfg["int_h"], cfg["int_m"],
-                                  cfg["int_s"], cfg["int_ms"])
-        interval = max(interval, 0.01)   # floor at 10 ms
+        reason = "Stopped"
+        cfg = self.config
+        try:
+            controller = self.controller_factory()
+            button = {
+                "Left": Button.left,
+                "Right": Button.right,
+                "Middle": Button.middle,
+            }[cfg.button]
 
-        repeat_mode  = cfg["repeat_mode"]   # "infinite" | "count" | "duration"
-        target_count = cfg.get("repeat_count", 0)
-        target_dur   = hms_to_seconds(cfg.get("dur_h", 0),
-                                      cfg.get("dur_m", 0),
-                                      cfg.get("dur_s", 0))
-        start_time   = time.monotonic()
-        done_reason  = None
+            # A short, fixed grace period lets the user move away from Start.
+            if self.stop_event.wait(self.start_delay):
+                return
 
-        # ── initial delay ─────────────────────
-        # Give the user time to move focus away from the app window
-        # before the first click fires (especially important for
-        # "current cursor" mode where clicking Start would self-click).
-        START_DELAY = max(interval, 0.3)
-        if self._sleep_interruptible(START_DELAY):
-            self.on_done_cb("Stopped")
-            return
+            deadline = None
+            if cfg.repeat_mode == "duration":
+                deadline = self.clock() + cfg.duration_seconds
 
-        while not self.stop_event.is_set():
-            # ── termination checks ────────────────
-            if repeat_mode == "count" and self._click_count >= target_count:
-                done_reason = "Reached click limit"
-                break
-            if repeat_mode == "duration":
-                elapsed = time.monotonic() - start_time
-                if elapsed >= target_dur:
-                    done_reason = "Duration elapsed"
+            while not self.stop_event.is_set():
+                if deadline is not None and self.clock() >= deadline:
+                    reason = "Duration elapsed"
                     break
 
-            # ── click ─────────────────────────
-            self._do_click(mc, button, double)
-            self._click_count += 1
-            self.on_click_cb(self._click_count)
+                completed = self._perform_action(controller, button, deadline)
+                if not completed:
+                    if deadline is not None and not self.stop_event.is_set():
+                        reason = "Duration elapsed"
+                    break
 
-            # ── wait for next click ───────────
-            if self._sleep_interruptible(interval):
-                break
+                self._click_count += 1
+                self.on_click_cb(self.run_id, self._click_count)
 
-        if not self.stop_event.is_set():
-            self.stop_event.set()
-        self.on_done_cb(done_reason or "Stopped")
+                if (cfg.repeat_mode == "count"
+                        and self._click_count >= cfg.repeat_count):
+                    reason = "Reached click limit"
+                    break
+
+                wait_time = cfg.interval_seconds
+                if deadline is not None:
+                    remaining = max(0.0, deadline - self.clock())
+                    if remaining <= 0:
+                        reason = "Duration elapsed"
+                        break
+                    wait_time = min(wait_time, remaining)
+
+                if self.stop_event.wait(wait_time):
+                    break
+        except Exception as exc:
+            reason = f"Error: {exc}"
+        finally:
+            if reason == "Stopped" and self.stop_event.is_set():
+                reason = self._stop_reason
+            self.on_done_cb(self.run_id, reason)
 
 
 # ─────────────────────────────────────────────
@@ -191,9 +285,13 @@ class AutoClickerApp:
 
         # ── state ──────────────────────────────
         self.worker: ClickWorker | None = None
-        self.is_running = False
+        self.run_state = "stopped"
+        self.active_run_id = 0
         self.total_clicks = 0
         self.ui_queue: queue.Queue = queue.Queue()
+        self._closing = False
+        self._shutdown_deadline = None
+        self.hotkey_listener = None
 
         # hotkey debounce
         self._last_hotkey_time = 0.0
@@ -205,6 +303,7 @@ class AutoClickerApp:
         # ── build UI ───────────────────────────
         self._build_ui()
         self._apply_styles()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # ── start hotkey listener ──────────────
         self._start_hotkey_listener()
@@ -273,7 +372,7 @@ class AutoClickerApp:
             col.pack(side="left", padx=6, pady=6)
             tk.Label(col, text=lbl, font=("Consolas", 8), bg=BG_PANEL,
                      fg=FG_DIM).pack()
-            var = tk.IntVar(value=default)
+            var = tk.StringVar(value=str(default))
             self.int_vars.append(var)
             sb = tk.Spinbox(col, from_=0,
                             to=(23 if i == 0 else 59 if i < 3 else 999),
@@ -316,7 +415,8 @@ class AutoClickerApp:
                  bg=BG_PANEL, fg=FG_DIM).pack(anchor="w")
         self.click_type_var = tk.StringVar(value="Single")
         ct_combo = tk.OptionMenu(type_col, self.click_type_var,
-                                 "Single", "Double")
+                                 "Single", "Double", "Hold",
+                                 command=lambda _value: self._toggle_click_type())
         ct_combo.config(font=FONT_MAIN, bg=BG_WIDGET, fg=FG_PRIMARY,
                         activebackground=ACCENT2, activeforeground=FG_PRIMARY,
                         highlightthickness=0, relief="flat", width=7,
@@ -325,6 +425,20 @@ class AutoClickerApp:
                                 activebackground=ACCENT2, activeforeground=FG_PRIMARY,
                                 bd=0)
         ct_combo.pack()
+
+        # Hold duration
+        hold_col = tk.Frame(opts_frame, bg=BG_PANEL)
+        hold_col.pack(side="left", padx=10, pady=6)
+        tk.Label(hold_col, text="Hold (ms)", font=("Consolas", 8),
+                 bg=BG_PANEL, fg=FG_DIM).pack(anchor="w")
+        self.hold_ms_var = tk.StringVar(value="500")
+        self.hold_spin = tk.Spinbox(
+            hold_col, from_=1, to=10_000, width=7,
+            textvariable=self.hold_ms_var, font=FONT_BOLD,
+            bg=BG_WIDGET, fg=FG_PRIMARY, insertbackground=FG_PRIMARY,
+            disabledbackground=BG_WIDGET, disabledforeground=FG_PRIMARY,
+            buttonbackground=BG_WIDGET, relief="flat", state="disabled")
+        self.hold_spin.pack()
 
         # ── Click Position ─────────────────────
         self._section(left, "📍  Click Position")
@@ -349,7 +463,7 @@ class AutoClickerApp:
         coord_row.pack(fill="x", padx=8, pady=6)
         tk.Label(coord_row, text="X:", font=FONT_BOLD, bg=BG_PANEL,
                  fg=FG_DIM).pack(side="left")
-        self.pos_x_var = tk.IntVar(value=0)
+        self.pos_x_var = tk.StringVar(value="0")
         self.pos_x_entry = tk.Entry(coord_row, textvariable=self.pos_x_var,
                                     width=6, font=FONT_BOLD, bg=BG_WIDGET,
                                     fg=FG_PRIMARY, insertbackground=FG_PRIMARY,
@@ -359,7 +473,7 @@ class AutoClickerApp:
         self.pos_x_entry.pack(side="left", padx=4)
         tk.Label(coord_row, text="Y:", font=FONT_BOLD, bg=BG_PANEL,
                  fg=FG_DIM).pack(side="left")
-        self.pos_y_var = tk.IntVar(value=0)
+        self.pos_y_var = tk.StringVar(value="0")
         self.pos_y_entry = tk.Entry(coord_row, textvariable=self.pos_y_var,
                                     width=6, font=FONT_BOLD, bg=BG_WIDGET,
                                     fg=FG_PRIMARY, insertbackground=FG_PRIMARY,
@@ -401,7 +515,7 @@ class AutoClickerApp:
         count_row.pack(fill="x", padx=8, pady=4)
         tk.Label(count_row, text="Times:", font=FONT_MAIN, bg=BG_PANEL,
                  fg=FG_DIM).pack(side="left")
-        self.repeat_count_var = tk.IntVar(value=10)
+        self.repeat_count_var = tk.StringVar(value="10")
         self.count_spin = tk.Spinbox(count_row, from_=1, to=9_999_999,
                                      textvariable=self.repeat_count_var,
                                      width=8, font=FONT_BOLD, bg=BG_WIDGET,
@@ -417,7 +531,7 @@ class AutoClickerApp:
         dur_row.pack(fill="x", padx=8, pady=4)
         tk.Label(dur_row, text="Duration  H:", font=FONT_MAIN,
                  bg=BG_PANEL, fg=FG_DIM).pack(side="left")
-        self.dur_h_var = tk.IntVar(value=0)
+        self.dur_h_var = tk.StringVar(value="0")
         self.dur_h_spin = tk.Spinbox(dur_row, from_=0, to=23,
                                      textvariable=self.dur_h_var,
                                      width=3, font=FONT_BOLD, bg=BG_WIDGET,
@@ -429,7 +543,7 @@ class AutoClickerApp:
         self.dur_h_spin.pack(side="left", padx=2)
         tk.Label(dur_row, text="M:", font=FONT_MAIN, bg=BG_PANEL,
                  fg=FG_DIM).pack(side="left")
-        self.dur_m_var = tk.IntVar(value=0)
+        self.dur_m_var = tk.StringVar(value="0")
         self.dur_m_spin = tk.Spinbox(dur_row, from_=0, to=59,
                                      textvariable=self.dur_m_var,
                                      width=3, font=FONT_BOLD, bg=BG_WIDGET,
@@ -441,7 +555,7 @@ class AutoClickerApp:
         self.dur_m_spin.pack(side="left", padx=2)
         tk.Label(dur_row, text="S:", font=FONT_MAIN, bg=BG_PANEL,
                  fg=FG_DIM).pack(side="left")
-        self.dur_s_var = tk.IntVar(value=30)
+        self.dur_s_var = tk.StringVar(value="30")
         self.dur_s_spin = tk.Spinbox(dur_row, from_=0, to=59,
                                      textvariable=self.dur_s_var,
                                      width=3, font=FONT_BOLD, bg=BG_WIDGET,
@@ -527,11 +641,17 @@ class AutoClickerApp:
     #  UI TOGGLES
     # ══════════════════════════════════════════
     def _toggle_pos_mode(self):
-        fixed = self.pos_mode_var.get() == "fixed"
+        self._cancel_capture()
+        fixed = (self.pos_mode_var.get() == "fixed"
+                 and self.run_state == "stopped")
         state = "normal" if fixed else "disabled"
         self.pos_x_entry.config(state=state)
         self.pos_y_entry.config(state=state)
         self.capture_btn.config(state=state)
+
+    def _toggle_click_type(self):
+        state = "normal" if self.click_type_var.get() == "Hold" else "disabled"
+        self.hold_spin.config(state=state)
 
     def _toggle_repeat_mode(self):
         mode = self.repeat_var.get()
@@ -543,40 +663,60 @@ class AutoClickerApp:
     #  CAPTURE POSITION
     # ══════════════════════════════════════════
     def _start_capture(self):
-        if self.is_running:
+        if self.run_state != "stopped" or self.pos_mode_var.get() != "fixed":
             return
+        self._cancel_capture()
         self.capture_btn.config(state="disabled")
         self._do_capture_countdown(3)
 
     def _do_capture_countdown(self, remaining):
+        self._capture_after_id = None
+        if (self._closing or self.run_state != "stopped"
+                or self.pos_mode_var.get() != "fixed"):
+            self._cancel_capture()
+            return
         if remaining > 0:
             self.capture_label.config(
                 text=f"Move cursor to target… {remaining}s", fg=ACCENT)
             self._capture_after_id = self.root.after(
                 1000, self._do_capture_countdown, remaining - 1)
         else:
-            # Capture current mouse position using pynput
-            mc = MouseController()
-            x, y = mc.position
-            self.pos_x_var.set(int(x))
-            self.pos_y_var.set(int(y))
-            self.capture_label.config(
-                text=f"Captured: ({int(x)}, {int(y)})", fg=FG_GREEN)
+            try:
+                controller = MouseController()
+                x, y = controller.position
+                self.pos_x_var.set(str(int(x)))
+                self.pos_y_var.set(str(int(y)))
+                self.capture_label.config(
+                    text=f"Captured: ({int(x)}, {int(y)})", fg=FG_GREEN)
+                self.log(f"Position captured: X={int(x)}, Y={int(y)}")
+            except Exception as exc:
+                self.capture_label.config(text="Position capture failed", fg=FG_RED)
+                self.log(f"⚠ Position capture failed: {exc}")
             self.capture_btn.config(state="normal")
-            self.log(f"Position captured: X={int(x)}, Y={int(y)}")
+
+    def _cancel_capture(self):
+        if self._capture_after_id is not None:
+            try:
+                self.root.after_cancel(self._capture_after_id)
+            except tk.TclError:
+                pass
+            self._capture_after_id = None
+        if hasattr(self, "capture_label"):
+            self.capture_label.config(text="")
 
     # ══════════════════════════════════════════
     #  START / STOP LOGIC
     # ══════════════════════════════════════════
     def build_config(self):
-        """Snapshot current UI values into a plain dict for the worker."""
-        return {
+        """Read and validate a snapshot of the current UI values."""
+        values = {
             "int_h":        self.int_vars[0].get(),
             "int_m":        self.int_vars[1].get(),
             "int_s":        self.int_vars[2].get(),
             "int_ms":       self.int_vars[3].get(),
             "button":       self.mouse_button_var.get(),
             "click_type":   self.click_type_var.get(),
+            "hold_ms":      self.hold_ms_var.get(),
             "position_mode": self.pos_mode_var.get(),
             "pos_x":        self.pos_x_var.get(),
             "pos_y":        self.pos_y_var.get(),
@@ -586,83 +726,126 @@ class AutoClickerApp:
             "dur_m":        self.dur_m_var.get(),
             "dur_s":        self.dur_s_var.get(),
         }
+        return ClickConfig.from_values(values)
 
     def toggle_clicking(self):
         """Toggle between running and stopped states."""
-        if self.is_running:
-            self._stop_clicking("User stopped")
-        else:
+        if self.run_state == "running":
+            self._request_stop("User stopped")
+        elif self.run_state == "stopped":
             self._start_clicking()
 
     def _start_clicking(self):
-        cfg = self.build_config()
-        interval = hms_to_seconds(cfg["int_h"], cfg["int_m"],
-                                  cfg["int_s"], cfg["int_ms"])
-        if interval < 0.01:
-            self.log("⚠ Interval too small (min 10ms). Set to 10ms.")
+        if self.run_state != "stopped" or self._closing:
+            return
+        self._cancel_capture()
+        try:
+            cfg = self.build_config()
+        except ConfigError as exc:
+            self.log(f"⚠ Cannot start: {exc}")
+            return
 
-        self.is_running = True
+        self.active_run_id += 1
+        run_id = self.active_run_id
+        self.total_clicks = 0
+        self.click_count_label.config(text="Clicks: 0")
+        self.run_state = "running"
+        self._toggle_pos_mode()
         self._session_start = time.monotonic()
-        self._set_status(True)
+        self._set_status("running")
 
         self.worker = ClickWorker(
             config=cfg,
+            run_id=run_id,
             on_click_cb=self._on_click,
             on_done_cb=self._on_worker_done,
         )
-        self.worker.start()
-        self.log(f"▶ Started | {cfg['click_type']} {cfg['button']} click | "
-                 f"interval: {int(cfg['int_h'])}h {int(cfg['int_m'])}m "
-                 f"{int(cfg['int_s'])}s {int(cfg['int_ms'])}ms")
+        try:
+            self.worker.start()
+        except Exception as exc:
+            self.worker = None
+            self.run_state = "stopped"
+            self._toggle_pos_mode()
+            self._set_status("stopped")
+            self.log(f"⚠ Could not start click worker: {exc}")
+            return
 
-    def _stop_clicking(self, reason=""):
-        if self.worker and self.worker.is_alive():
-            self.worker.stop()
+        interval_text = (f"{cfg.interval_seconds * 1000:g}ms"
+                         if cfg.interval_seconds < 1
+                         else f"{cfg.interval_seconds:g}s")
+        hold_text = (f" | hold: {cfg.hold_seconds * 1000:g}ms"
+                     if cfg.click_type == "Hold" else "")
+        self.log(f"▶ Started | {cfg.click_type} {cfg.button} action | "
+                 f"interval: {interval_text}{hold_text}")
+
+    def _request_stop(self, reason="Stopped"):
+        if self.run_state != "running":
+            return
+        self.run_state = "stopping"
+        self._set_status("stopping")
+        if self.worker:
+            self.worker.stop(reason)
+
+    def _finish_run(self, run_id, reason):
+        if run_id != self.active_run_id:
+            return
         elapsed = time.monotonic() - getattr(self, "_session_start", time.monotonic())
         h, m, s = seconds_to_hms(elapsed)
-        self.is_running = False
-        self._set_status(False)
-        if reason:
+        self.worker = None
+        self.run_state = "stopped"
+        self._toggle_pos_mode()
+        self._set_status("stopped")
+        if reason and not self._closing:
             self.log(f"■ Stopped — {reason} | runtime: {h:02d}:{m:02d}:{s:02d} | clicks: {self.total_clicks:,}")
 
-    def _set_status(self, running: bool):
+    def _set_status(self, state):
         """Update UI status indicators (must run on main thread)."""
-        if running:
+        if state == "running":
             self.status_dot.config(fg=FG_GREEN)
             self.status_label.config(text=" RUNNING", fg=FG_GREEN)
-            self.start_stop_btn.config(text="■  STOP", bg=FG_RED, fg=FG_PRIMARY)
+            self.start_stop_btn.config(
+                text="■  STOP", bg=FG_RED, fg=FG_PRIMARY, state="normal")
+        elif state == "stopping":
+            self.status_dot.config(fg=ACCENT)
+            self.status_label.config(text=" STOPPING", fg=ACCENT)
+            self.start_stop_btn.config(
+                text="STOPPING…", bg=BG_WIDGET, fg=FG_DIM, state="disabled")
         else:
             self.status_dot.config(fg=FG_RED)
             self.status_label.config(text=" STOPPED", fg=FG_RED)
-            self.start_stop_btn.config(text="▶  START", bg=FG_GREEN, fg=BG_DARK)
+            self.start_stop_btn.config(
+                text="▶  START", bg=FG_GREEN, fg=BG_DARK, state="normal")
 
     # ══════════════════════════════════════════
     #  THREAD-SAFE CALLBACKS (via queue)
     # ══════════════════════════════════════════
-    def _on_click(self, count):
+    def _on_click(self, run_id, count):
         """Called from worker thread — enqueue UI update."""
-        self.ui_queue.put(("click", count))
+        self.ui_queue.put(("click", run_id, count))
 
-    def _on_worker_done(self, reason):
+    def _on_worker_done(self, run_id, reason):
         """Called from worker thread — enqueue stop update."""
-        self.ui_queue.put(("done", reason))
+        self.ui_queue.put(("done", run_id, reason))
 
     def _poll_queue(self):
         """Drain the UI queue on the main thread every 50 ms."""
         try:
             while True:
-                msg_type, payload = self.ui_queue.get_nowait()
+                msg_type, run_id, payload = self.ui_queue.get_nowait()
                 if msg_type == "click":
-                    self.total_clicks = payload
-                    self.click_count_label.config(text=f"Clicks: {payload:,}")
+                    if run_id == self.active_run_id:
+                        self.total_clicks = payload
+                        self.click_count_label.config(text=f"Clicks: {payload:,}")
                 elif msg_type == "done":
-                    if self.is_running:
-                        self._stop_clicking(payload)
+                    self._finish_run(run_id, payload)
+                elif msg_type == "toggle" and not self._closing:
+                    self.toggle_clicking()
                 elif msg_type == "log":
                     self._write_log(payload)
         except queue.Empty:
             pass
-        self.root.after(50, self._poll_queue)
+        if not self._closing:
+            self.root.after(50, self._poll_queue)
 
     def log(self, message: str):
         """Thread-safe logger — can be called from any thread."""
@@ -671,7 +854,7 @@ class AutoClickerApp:
         if threading.current_thread() is threading.main_thread():
             self._write_log(entry)
         else:
-            self.ui_queue.put(("log", entry))
+            self.ui_queue.put(("log", None, entry))
 
     def _write_log(self, entry: str):
         self.log_text.config(state="normal")
@@ -685,6 +868,9 @@ class AutoClickerApp:
         self.log_text.config(state="disabled")
 
     def _reset_counter(self):
+        if self.run_state != "stopped":
+            self.log("⚠ Stop clicking before resetting the counter.")
+            return
         self.total_clicks = 0
         self.click_count_label.config(text="Clicks: 0")
         self.log("Counter reset.")
@@ -705,16 +891,49 @@ class AutoClickerApp:
             if now - self._last_hotkey_time < HOTKEY_DEBOUNCE_SEC:
                 return
             self._last_hotkey_time = now
-            # Schedule toggle on the main thread
-            self.root.after(0, self.toggle_clicking)
+            self.ui_queue.put(("toggle", None, None))
 
         def on_release(key):
             if key == DEFAULT_HOTKEY:
                 self._hotkey_pressed = False
 
-        listener = KeyListener(on_press=on_press, on_release=on_release,
-                               daemon=True)
-        listener.start()
+        try:
+            self.hotkey_listener = KeyListener(
+                on_press=on_press, on_release=on_release, daemon=True)
+            self.hotkey_listener.start()
+        except Exception as exc:
+            self.hotkey_listener = None
+            self.log(f"⚠ Global F6 hotkey unavailable: {exc}")
+
+    # ══════════════════════════════════════════
+    #  ORDERLY SHUTDOWN
+    # ══════════════════════════════════════════
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_capture()
+        if self.hotkey_listener is not None:
+            try:
+                self.hotkey_listener.stop()
+            except Exception:
+                pass
+        if self.worker and self.worker.is_alive():
+            self.run_state = "stopping"
+            self._set_status("stopping")
+            self.worker.stop("Application closed")
+            self._shutdown_deadline = time.monotonic() + 2.0
+            self.root.after(10, self._await_shutdown)
+        else:
+            self.root.destroy()
+
+    def _await_shutdown(self):
+        worker_alive = self.worker is not None and self.worker.is_alive()
+        if (worker_alive and self._shutdown_deadline is not None
+                and time.monotonic() < self._shutdown_deadline):
+            self.root.after(25, self._await_shutdown)
+            return
+        self.root.destroy()
 
 
 # ─────────────────────────────────────────────

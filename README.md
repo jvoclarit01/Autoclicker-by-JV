@@ -1,69 +1,78 @@
-# Auto Clicker
+# AutoClicker Pro
 
-A desktop auto clicker application built with Python, Tkinter, and pynput. Automates mouse clicks at specified intervals with customizable settings.
+AutoClicker Pro is a desktop mouse automation tool built with Python, Tkinter, and pynput.
 
 ## Features
 
-- **Click Interval**: Set precise timing in hours, minutes, seconds, and milliseconds
-- **Button Selection**: Choose Left, Middle, or Right mouse button
-- **Click Type**: Single or Double clicks
-- **Repeat Modes**: Run until stopped or for a fixed number of clicks
-- **Position Options**: Click at current cursor position or fixed X/Y coordinates
-- **Hotkey Toggle**: Start/stop with F6 (or custom hotkey)
-- **Activity Log**: Real-time logging of actions
-- **Cross-Platform**: Works on Windows, macOS, and Linux
+- Configurable click interval in hours, minutes, seconds, and milliseconds
+- Left, middle, and right mouse buttons
+- Single-click, double-click, and configurable click-and-hold actions
+- Infinite, fixed-count, and fixed-duration repeat modes
+- Current cursor or fixed X/Y position
+- Global F6 start/stop hotkey
+- Thread-safe activity log and responsive cancellation
+
+In **Hold** mode, the selected button remains pressed for 1–10,000 milliseconds. After release, the app waits for the normal click interval before beginning the next action. Stopping the app or reaching a duration deadline releases the button immediately.
 
 ## Requirements
 
-- Python 3.6+
-- pynput library
+- Python 3.10 or newer
+- Tkinter (normally included with Python)
+- Dependencies listed in `requirements.txt`
 
 ## Installation
 
-1. Install Python from [python.org](https://python.org) if not already installed
-2. Install the required dependency:
-   ```bash
-   pip install pynput
-   ```
+```powershell
+python -m pip install -r requirements.txt
+python autoclicker.py
+```
 
-## Download Executable (Windows)
-
-For users who prefer not to install Python, a pre-built executable is available for Windows:
-
-1. Download the latest `autoclicker.exe` file from the assets section
-2. Run the executable directly (no installation required)
-3. The application will start with the same interface and functionality as the Python version
-
-**Note**: The executable is built for Windows only. For macOS and Linux, please use the Python version above.
+On macOS, grant Accessibility permission to Python or the terminal running the app. Linux users need an active supported desktop session. Windows users normally do not need administrator privileges.
 
 ## Usage
 
-1. Run the application:
-   ```bash
-   python autoclicker.py
-   ```
+1. Set the interval between completed mouse actions.
+2. Select a mouse button and action type.
+3. For Hold mode, set the hold duration in milliseconds; `500` means half a second and `1000` means one second.
+4. Select a repeat mode and click position.
+5. Click **Start** or press **F6**. Use the same control to stop.
 
-2. Configure settings:
-   - Set click interval
-   - Choose button and click type
-   - Select repeat mode
-   - Choose click position
+The app waits 300 milliseconds before the first action so you can move the pointer away from the Start button. A fixed run duration begins after this startup grace period. An action interrupted while holding is released safely and is not counted as completed.
 
-3. Click "Start" or press F6 to begin clicking
+## Windows Executable
 
-4. Click "Stop" or press F6 again to stop
+`autoclicker.exe` is a standalone Windows build of the same source. It is not digitally signed, so Windows may display a security warning. Verify the SHA-256 checksum published with the build if the file was downloaded from elsewhere.
+
+Current v1.1 SHA-256: `4D9D9C238DEF8EA45CCA73223FFE159D66E639ABA2D95752481EDFEFA3581B1F`
+
+To rebuild it locally:
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\build.ps1
+```
+
+The build script creates a one-file, windowed PyInstaller executable, copies it to the repository root, and prints its SHA-256 checksum.
+
+## Tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The worker tests use a fake mouse controller and do not click the real mouse.
 
 ## Troubleshooting
 
-- **Permission Issues**: On Windows, run as Administrator. On macOS, grant Accessibility permissions in System Preferences > Security & Privacy > Accessibility
-- **Hotkey Not Working**: Ensure the application window is not minimized (hotkeys work globally)
-- **Mouse Control Fails**: Check that pynput is installed correctly and no other applications are interfering with mouse input
-- **Application Crashes**: Check the Activity Log for error messages
+- **Invalid setting:** Read the Activity Log for the exact accepted range.
+- **Hotkey unavailable:** Another app may have captured F6, or the operating system may not permit global keyboard monitoring.
+- **Mouse control fails:** Confirm pynput is installed and the operating system has granted the necessary input-control permission.
+- **macOS/Linux:** Accessibility or desktop-session restrictions can prevent pynput from controlling input.
 
-## Coder
+## Author
 
 JV Oclarit
 
 ## License
 
-MIT License - feel free to use and modify as needed.
+MIT License. See `LICENSE`.
